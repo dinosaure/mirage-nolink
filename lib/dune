@@ -1,0 +1,13 @@
+(library
+ (name caml_objinfo)
+ (modules caml_objinfo)
+ (libraries astring compiler-libs.common bos rresult))
+
+(library
+ (name selective)
+ (modules selective))
+
+(library
+ (name resolver)
+ (modules resolver)
+ (libraries caml_objinfo selective))

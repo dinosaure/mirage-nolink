@@ -1,0 +1,3 @@
+(executable
+ (name resolve)
+ (libraries resolver))
