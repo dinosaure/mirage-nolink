@@ -11,3 +11,8 @@
  (name resolver)
  (modules resolver)
  (libraries caml_objinfo selective))
+
+(library
+ (name mirage_nolink)
+ (modules mirage_nolink)
+ (libraries resolver))

@@ -1,38 +1,98 @@
 open Rresult
 open Resolver
+open Mirage_nolink
 
-module Digest = struct
-  include Digest
+let target : [ `Unix | `Freestanding | `Xen ] ref = ref `Unix
+let impl : [ `C | `OCaml ] ref = ref `C
 
-  let pp = Fmt.using Digest.to_hex Fmt.string
-end
+let stdlib = Caml_name.v "Stdlib"
+and stdlib_resolver _who _digest res =
+  let is_stdlib = function
+    | `Object _ -> false
+    | `Caml x -> match Fpath.basename (Caml_obj.path x) with
+      | "stdlib.cmxa" -> true
+      | _ -> false in
+  try [ List.find is_stdlib res ], []
+  with Not_found -> [], []
 
-let recognize_argument v =
-  Bos.OS.Path.exists v >>= function
-  | true when Fpath.is_dir_path v -> R.ok (`Lookup v)
-  | false -> R.error_msgf "<%a> does not exists" Fpath.pp v
-  | true -> match Fpath.get_ext v with
-    | ".cmi" | ".cmx" | ".cmo" | ".cmt" | ".cma" | ".cmti" | ".cmxa" ->
-      Caml_obj.of_path v >>| fun v -> `Root v
-    | ext -> R.error_msgf "Invalid extension of <%a> (%s)" Fpath.pp v ext
+let () = Mirage_nolink.register ~name:stdlib stdlib_resolver
+let () = Mirage_nolink.register ~name:(Caml_name.v "CamlinternalFormatBasics") stdlib_resolver
 
-module Base = struct
-  type 'a t = 'a
+let rec z = Caml_name.v "Z"
+and gmp = Caml_name.v "Gmp"
+and z_resolver _who _digest res =
+  match !target with
+  | `Unix ->
+    (* XXX(dinosaure): try to find [libgmp.a]? *)
+    take ~kind:Caml_obj.CMX ~archive:true ~name:(Caml_name.v "Zarith") res, []
+  | `Xen | `Freestanding as target->
+    let res =
+      Bos.OS.Cmd.(run_out Bos.Cmd.(v "opam" % "config" % "var" % "lib") |> to_string)
+      >>| Fpath.v
+      >>= fun lib ->
+      ( match target with
+        | `Xen -> Obj.of_path ~name:gmp Fpath.(lib / "gmp-xen" / "libgmp_xen.a")
+        | `Freestanding -> Obj.of_path ~name:gmp Fpath.(lib / "gmp-freestanding" / "libgmp_freestanding.a") )
+      >>| fun static -> take ~kind:Caml_obj.CMX ~archive:false ~name:z res, [ `Object static ] in
+    match res with
+    | Ok res -> res
+    | Error _ -> [], []
 
-  let return x = x
-  let apply f x = f x
-  let map x ~f = f x
-  let select e f = match e with
-    | Selective.Either.L x -> f x
-    | Selective.Either.R y -> y
-end
+let () = Mirage_nolink.register ~name:z z_resolver
 
-module Selective = struct
-  include Selective.Make(Base)
-  let run x = x
-end
+let rec native = Caml_name.v "Native"
+and native_resolver _who _digest _res =
+  let res =
+    Bos.OS.Cmd.(run_out Bos.Cmd.(v "opam" % "config" % "var" % "lib") |> to_string)
+    >>| Fpath.v
+    >>= fun lib -> match !target with
+    | `Unix -> Obj.of_path ~name:native Fpath.(lib / "nocrypto" / "libnocrypto_stubs.a")
+    | `Xen -> Obj.of_path ~name:native Fpath.(lib / "nocrypto" / "libnocrypto_stubs+mirage-xen.a")
+    | `Freestanding -> Obj.of_path ~name:native Fpath.(lib / "nocrypto" / "libnocrypto_stubs+mirage-freestanding.a") in
+  match res with
+  | Ok x -> [ `Object x ], []
+  | Error _ -> [], []
 
-module Gamma = Resolver.Gamma(struct include Selective let run = run end)
+let () = Mirage_nolink.register ~name:native native_resolver
+
+let digestif = Caml_name.v "Digestif"
+let digestif_resolver _who _digest res =
+  match !target, !impl with
+  | _, `OCaml ->
+    let is_digestif_ocaml = function
+      | `Object _ -> false
+      | `Caml x -> match Fpath.basename (Caml_obj.path x) with
+        | "digestif_ocaml.cmxa" -> true
+        | _ -> false in
+    List.filter is_digestif_ocaml res, []
+  | `Unix, `C ->
+    let is_digestif_c = function
+      | `Object _ -> false
+      | `Caml x -> match Fpath.basename (Caml_obj.path x) with
+        | "digestif_c.cmxa" -> Caml_obj.in_archive x && Caml_obj.kind x = Caml_obj.CMX
+        | _ -> false in
+    List.filter is_digestif_c res, []
+  | (`Freestanding | `Xen), `C ->
+    let is_digestif_c = function
+      | `Object _ -> false
+      | `Caml x -> match Fpath.basename (Caml_obj.path x) with
+        | "digestif_c.cmx" -> not (Caml_obj.in_archive x) && Caml_obj.kind x = Caml_obj.CMX
+        | _ -> false in
+    List.filter is_digestif_c res, []
+
+let () = Mirage_nolink.register ~name:digestif digestif_resolver
+
+let rakia = Caml_name.v "Rakia"
+and rakia_resolver _who _digest res =
+  let is ~basename = function
+    | `Object _ -> false
+    | `Caml x -> Fpath.basename (Caml_obj.path x) = basename in
+  match !target with
+  | `Unix -> List.filter (is ~basename:"rakia_unix.cmxa") res, []
+  | `Freestanding -> List.filter (is ~basename:"rakia_freestanding.cmxa") res, []
+  | `Xen -> List.filter (is ~basename:"rakia_xen.cmxa") res, []
+
+let () = Mirage_nolink.register ~name:rakia rakia_resolver
 
 let populate roots =
   let rec select pending acc = function
@@ -58,54 +118,13 @@ let populate roots =
       Bos.OS.Dir.contents ~dotfiles:false ~rel:false x >>= select r acc in
   go roots Gamma.empty
 
-let select (name, kind, _) dep res =
-  let res = List.filter (function
-      | `Caml x -> Caml_obj.kind x = kind
-      | `Object _ -> kind = Caml_obj.CMX) res in
-  match res with
-  | [] ->
-    let dep, _ = dep in
-    Fmt.pr "[%a] wants [%a] but no caml objects exist.\n%!" Caml_name.pp name Caml_name.pp dep ;
-    let rec repl () =
-      Fmt.pr ">>> %!" ;
-      match input_line stdin with
-      | path -> match Fpath.of_string path with
-        | Error _ -> Fmt.epr "<<< Invalid path.\n%!" ; repl ()
-        | Ok path -> Obj.of_path ~name:dep path |> function
-          | Error err  -> Fmt.epr "<<< %a.\n%!" Resolver.pp_error err ; repl ()
-          | Ok t -> [ `Object t ] in
-    repl ()
-  | [ x ] -> [ x ]
-  | res ->
-    Fmt.pr "[%a] wants to be resolved with:\n%!" Caml_name.pp name ;
-    let pp i = function
-      | `Caml x ->
-        let copts = Caml_obj.copts x in
-        let cobjs = Caml_obj.cobjs x in
-        Fmt.pr "%3d. %a.\n%!" i Fpath.pp (Caml_obj.path x) ;
-        if List.length copts > 0
-        then Fmt.pr "    copts: %a\n%!" Fmt.(Dump.list string) copts ;
-        if List.length cobjs > 0
-        then Fmt.pr "    cobjs: %a\n%!" Fmt.(Dump.list string) cobjs
-      | `Object x ->
-        Fmt.pr "%3d. %a.\n%!" i Obj.pp x in
-    List.iteri pp res ;
-
-    let rec repl () =
-      Fmt.pr ">>> %!" ;
-      match int_of_string (input_line stdin) with
-      | n ->
-        if n >= 0 && n < List.length res
-        then [ List.nth res n ]
-        else ( Fmt.epr "<<< Bad number.\n%! " ; repl () )
-      | exception (Invalid_argument _) ->
-        Fmt.epr "<<< Bad input.\n%!" ; repl () in
-    repl ()
-
-let ident x = Caml_obj.name x, Caml_obj.kind x, Caml_obj.path x
-let pp_artifact = Caml_obj.pp
-
-module Resolver = Make(Gamma)
+let recognize_argument x =
+  Bos.OS.Path.exists x >>= function
+  | false -> R.error_msgf "%a does not exist" Fpath.pp x
+  | true -> Bos.OS.Path.stat x >>= fun stat -> match stat.Unix.st_kind with
+    | Unix.S_REG -> Caml_obj.of_path x >>= fun x -> R.ok (`Root x)
+    | Unix.S_DIR -> R.ok (`Lookup x)
+    | _ -> R.error_msgf "Invalid path (neither file nor directory): %a" Fpath.pp x
 
 let run () =
   let argv = Array.sub Sys.argv 1 (Array.length Sys.argv - 1) in
@@ -119,20 +138,16 @@ let run () =
   populate (List.map (function `Lookup x -> x | _ -> assert false) paths) >>= fun gamma ->
   Fmt.pr "[%a] %d artifacts loaded.\n%!" Fmt.(styled `Blue string) "INF" (Gamma.cardinal gamma) ;
   let srcs = List.map (function `Root x -> List.map (fun x -> `Caml x) x | _ -> assert false) objects in
-  Resolver.resolve ident ~select ~srcs gamma |> function
+  Mirage_nolink.resolve ~kind:Caml_obj.CMX ~srcs gamma |> function
   | Ok _ as res -> res
   | Error _ as err -> err
-
-let pp_error ppf = function
-  | #Caml_objinfo.error as err -> Caml_objinfo.pp_error ppf err
-  | `Unresolved_dependency ((key, _, _), (name, digest)) ->
-    Fmt.pf ppf "Unresolved dependency. %a wants %a (%a)"
-      Caml_name.pp key Caml_name.pp name Fmt.(Dump.option Digest.pp) digest
 
 let () = match run () with
   | Ok ts ->
     let f k = function
       | `Caml x -> Fmt.pr "%a: %a\n%!" Caml_obj.pp x Caml_name.pp k
       | `Object x -> Fmt.pr "%a: %a\n%!" Obj.pp x Caml_name.pp k in
+    Fmt.pr ">>> Resolution done.\n%!" ;
     List.iter (Resolver.iter ~f) ts
-  | Error err -> Fmt.epr "[%a] %a.\n%!" Fmt.(styled `Red string) "ERR" pp_error err
+  | Error (#Mirage_nolink.error as err)-> Fmt.epr "[%a] %a.\n%!" Fmt.(styled `Red string) "ERR" Mirage_nolink.pp_error err
+  | Error (#Caml_objinfo.error as err)-> Fmt.epr "[%a] %a.\n%!" Fmt.(styled `Red string) "ERR" Caml_objinfo.pp_error err

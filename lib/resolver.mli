@@ -1,8 +1,9 @@
 open Rresult
 
 module Caml_name : sig
-  type t = private string 
+  type t = private string
 
+  val v : string -> t
   val to_string : t -> string
   val pp : t Fmt.t
   val compare : t -> t -> int
@@ -15,7 +16,7 @@ module Caml_obj : sig
   type t
 
   val pp : t Fmt.t
-  val kind : t -> kind 
+  val kind : t -> kind
   val name : t -> Caml_name.t
   val path : t -> Fpath.t
   val iface_digest : t -> Digest.t option
@@ -23,6 +24,7 @@ module Caml_obj : sig
   val in_archive : t -> bool
   val cobjs : t -> string list
   val copts : t -> string list
+  val link : bool -> t -> t
 
   val of_path : Fpath.t -> (t list, [> Caml_objinfo.error ]) result
   val to_dep : t -> dep

@@ -1,8 +1,15 @@
 open Rresult
 
+module Digest = struct
+  include Digest
+
+  let pp = Fmt.using Digest.to_hex Fmt.string
+end
+
 module Caml_name : sig
   type t = private string
 
+  val v : string -> t
   val unsafe : string -> t
   val to_string : t -> string
   val pp : t Fmt.t
@@ -11,6 +18,7 @@ module Caml_name : sig
 end = struct
   type t = string
 
+  let v x = x
   let unsafe x = x
   let to_string x = x
   let pp = Fmt.string
@@ -33,7 +41,7 @@ module Caml_obj : sig
   type t
 
   val pp : t Fmt.t
-  val kind : t -> kind 
+  val kind : t -> kind
   val name : t -> Caml_name.t
   val path : t -> Fpath.t
   val m : t -> t list
@@ -43,6 +51,7 @@ module Caml_obj : sig
   val in_archive : t -> bool
   val cobjs : t -> string list
   val copts : t -> string list
+  val link : bool -> t -> t
 
   val of_path : Fpath.t -> (t list, [> Caml_objinfo.error ]) result
   val to_dep : t -> dep
@@ -51,9 +60,9 @@ end = struct
     | CMI
     | CMO
     | CMX
- 
+
   type dep = Caml_name.t * Digest.t option
-  
+
   type t =
     { kind : kind
     ; name : Caml_name.t
@@ -63,6 +72,7 @@ end = struct
     ; in_archive : bool
     ; cobjs : string list
     ; copts : string list
+    ; link : bool
     ; m : t list Lazy.t }
 
   let pp ppf t = Fpath.pp ppf t.path
@@ -76,9 +86,10 @@ end = struct
   let m { m; _ } = Lazy.force m
   let cobjs { cobjs; _ } = cobjs
   let copts { copts; _ } = copts
-  
+  let link v t = { t with link= v }
+
   let to_dep { name; iface_digest; _ } = (name, iface_digest)
-  
+
   let of_s
     : type v. (module Caml_objinfo.S with type t = v) -> v -> kind -> Fpath.t -> (t list, [> R.msg ]) result
     = fun (module O) o kind path ->
@@ -90,9 +101,10 @@ end = struct
       ; in_archive= false
       ; cobjs= []
       ; copts= []
+      ; link= true (* XXX(dinosaure): default. *)
       ; m= lazy [ res ] } in
     Ok [ res ]
-  
+
   let of_cma cma path =
     let open Caml_objinfo in
     let cmos = CMA.cmos cma in
@@ -104,6 +116,7 @@ end = struct
       ; in_archive= true
       ; cobjs= CMA.custom_cobjs cma
       ; copts= CMA.custom_copts cma
+      ; link= true
       ; m } in
     let rec m = lazy (List.map (fun cmo -> of_cmo cmo m) cmos) in
     Ok (Lazy.force m)
@@ -119,6 +132,7 @@ end = struct
       ; in_archive= true
       ; cobjs= CMXA.cobjs cmxa
       ; copts= CMXA.copts cmxa
+      ; link= true
       ; m } in
     let rec m = lazy (List.map (fun cmx -> of_cmx cmx m) cmxs) in
     Ok (Lazy.force m)
@@ -280,14 +294,27 @@ let add ident t depss acc x =
       | `Object _ -> go t depss r
       | `Caml x' ->
         if Fpath.equal (Caml_obj.path x) (Caml_obj.path x')
-        then go t depss r else (* NOTE: assert false? *) acc
+        then go t depss r
+        else ( Fmt.epr "[%a] Found 2 objects (%a) with different path:\n%!"
+                 Fmt.(styled `Yellow string) "WARN"
+                 Caml_name.pp (Caml_obj.name x) ;
+               Fmt.epr "> %a\n%!"
+                 Fpath.pp (Caml_obj.path x) ;
+               Fmt.epr "> %a\n%!"
+                 Fpath.pp (Caml_obj.path x') ; acc )
       | exception Not_found ->
         let exception Exit in
         let add_dependency acc (n, digest) = match CMap.find n t with
           | exception Not_found -> (n, digest) :: acc
           | `Object _ -> acc
           | `Caml y' -> match digest, Caml_obj.iface_digest y' with
-            | Some a, Some b when not (Digest.equal a b) -> raise Exit
+            | Some a, Some b when not (Digest.equal a b) ->
+              Fmt.epr "[%a] Found an object (%a) with different hash than expected:\n%!"
+                Fmt.(styled `Yellow string) "WARN"
+                Caml_name.pp (Caml_obj.name x) ;
+              Fmt.epr "> %a: %a\n%!" Fpath.pp (Caml_obj.path y') Digest.pp a ;
+              Fmt.epr "> hash expected: %a\n%!" Digest.pp b ;
+              raise Exit
             | _ -> acc in
         match List.fold_left add_dependency [] (Caml_obj.iface_deps x) with
         | exception Exit -> acc
@@ -320,7 +347,7 @@ module Make (Gamma : GAMMA) = struct
       | (t, depss) :: r -> go acc r t depss
     and go acc next t depss =
       match depss with
-      | [] -> R.ok []
+      | [] -> resolve (t :: acc) next
       | (key, deps) :: rest ->
         match deps, rest with
         | [], [] -> resolve (t :: acc) next
